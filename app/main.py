@@ -55,6 +55,10 @@ class CompleteSale(BaseModel):
     force: bool = False
 
 
+class PauseAuction(BaseModel):
+    description: str = Field(min_length=1, max_length=300)
+
+
 class UpdatePhone(BaseModel):
     phone: str = Field(min_length=8, max_length=24)
 
@@ -155,7 +159,7 @@ def user_id_filter(user_id: str) -> dict: return {"$expr": {"$eq": [{"$toString"
 
 
 async def customer_snapshot(database, sale_id: str, user_id: str | None = None) -> dict:
-    sale = await database.sales.find_one({"_id": sale_id}, {"name": 1, "status": 1, "last_result": 1})
+    sale = await database.sales.find_one({"_id": sale_id}, {"name": 1, "status": 1, "last_result": 1, "is_paused": 1, "pause_description": 1})
     if not sale: raise HTTPException(404, "Sale not found.")
     completed_auctions = [auction async for auction in database.auctions.find({"sale_id": sale_id, "status": "completed"}, {"_id": 1, "product_id": 1})]
     completed_auction_ids = [auction["_id"] for auction in completed_auctions]
@@ -179,7 +183,23 @@ async def customer_snapshot(database, sale_id: str, user_id: str | None = None) 
     visible_last = None
     if last:
         visible_last = {"status": last["status"], "price": last.get("price"), "productName": last.get("product_name"), "quantityMl": last.get("quantity_ml"), "myOutcome": "won" if last.get("winner_id") == user_id else "lost", "randomReason": last.get("random_reason"), "tiedCount": last.get("tied_count", 0)}
-    result = {"saleId": sale_id, "saleName": sale["name"], "saleStatus": sale["status"], "lastResult": visible_last, "pastResults": past_results}
+    next_product = None
+    if sale["status"] == "live":
+        prepared_product = await database.products.find_one(
+            {"sale_id": sale_id, "status": "prepared"},
+            {"name": 1, "quantity_ml": 1, "image_url": 1},
+            sort=[("sequence", ASCENDING)],
+        )
+        if prepared_product:
+            next_product = {
+                "name": prepared_product["name"],
+                "quantityMl": prepared_product["quantity_ml"],
+                "imageUrl": prepared_product.get("image_url"),
+            }
+    result = {"saleId": sale_id, "saleName": sale["name"], "saleStatus": sale["status"], "lastResult": visible_last, "pastResults": past_results, "nextProduct": next_product}
+    if sale.get("is_paused"):
+        result.update({"state": "paused", "pause": {"description": sale.get("pause_description", "The sale is taking a short break.")}})
+        return result
     if not active:
         result["state"] = "completed" if sale["status"] == "completed" else "waiting"
         return result
@@ -192,7 +212,7 @@ async def customer_snapshot(database, sale_id: str, user_id: str | None = None) 
         bid = await database.bids.find_one({"auction_id": active["_id"], "round": active["round_number"], "user_id": user_id})
         personal_bid = bid and bid["amount"]
     participant_count = await database.bids.count_documents({"auction_id": active["_id"], "round": active["round_number"]})
-    result.update({"state": "running", "auction": {"id": active["_id"], "round": active["round_number"], "endsAt": utc_iso(active["ends_at"]), "floor": active["floor"], "product": product, "myBid": personal_bid, "participantCount": participant_count, "eligible": not active["eligible_user_ids"] or user_id in active["eligible_user_ids"]}})
+    result.update({"state": "running", "auction": {"id": active["_id"], "round": active["round_number"], "endsAt": utc_iso(active["ends_at"]), "floor": active["floor"], "product": product, "myBid": personal_bid, "participantCount": participant_count, "eligible": True}})
     return result
 
 
@@ -359,7 +379,7 @@ async def admin_product_detail(product_id: str, _: dict = Depends(require_admin)
 
 @app.get("/admin/sales/{sale_id}/live-dashboard")
 async def live_dashboard(sale_id: str, _: dict = Depends(require_admin), database=Depends(db)):
-    sale = await database.sales.find_one({"_id": sale_id}, {"name": 1, "status": 1, "last_result": 1})
+    sale = await database.sales.find_one({"_id": sale_id}, {"name": 1, "status": 1, "last_result": 1, "is_paused": 1, "pause_description": 1})
     if not sale: raise HTTPException(404, "Sale not found.")
     products = [product async for product in database.products.find({"sale_id": sale_id}, {"name": 1, "status": 1})]
     products_by_id = {product["_id"]: product for product in products}
@@ -369,7 +389,7 @@ async def live_dashboard(sale_id: str, _: dict = Depends(require_admin), databas
     results = [result async for result in database.auction_results.find({"auction_id": {"$in": [auction["_id"] for auction in all_auctions]}}).sort("completed_at", -1)]
     result_users = {str(user["_id"]): user async for user in database.users.find({}, {"name": 1, "email": 1, "phone": 1})}
     past_results = [{"productName": products_by_id.get(result["product_id"], {}).get("name", "Deleted product"), "status": result["status"], "price": result.get("price"), "winner": {"name": result_users.get(result.get("winner_id", ""), {}).get("name"), "email": result_users.get(result.get("winner_id", ""), {}).get("email"), "phone": result_users.get(result.get("winner_id", ""), {}).get("phone")}} for result in results]
-    dashboard = {"saleName": sale["name"], "saleStatus": sale["status"], "liveConnections": len(hub.connections.get(sale_id, set())), "progress": counts, "auction": None, "bids": [], "lastResult": sale.get("last_result"), "pastResults": past_results}
+    dashboard = {"saleName": sale["name"], "saleStatus": sale["status"], "salePaused": sale.get("is_paused", False), "pauseDescription": sale.get("pause_description"), "liveConnections": len(hub.connections.get(sale_id, set())), "progress": counts, "auction": None, "bids": [], "lastResult": sale.get("last_result"), "pastResults": past_results}
     if not auction: return dashboard
     product = await database.products.find_one({"_id": auction["product_id"]}, {"name": 1, "quantity_ml": 1, "base_price": 1, "image_url": 1})
     users = {str(user["_id"]): user async for user in database.users.find({}, {"name": 1, "email": 1})}
@@ -436,7 +456,7 @@ async def start_sale(sale_id: str, _: dict = Depends(require_admin), database=De
 
 @app.post("/admin/sales/{sale_id}/complete")
 async def complete_sale(sale_id: str, payload: CompleteSale, _: dict = Depends(require_admin), database=Depends(db)):
-    if await database.auctions.find_one({"sale_id": sale_id, "status": "running"}): raise HTTPException(409, "Cannot complete sale during an active auction.")
+    if await database.auctions.find_one({"sale_id": sale_id, "status": {"$in": ["running", "announcing", "settling"]}}): raise HTTPException(409, "Cannot complete sale during an active auction.")
     pending = await database.products.count_documents({"sale_id": sale_id, "status": "prepared"})
     if pending and not payload.force: raise HTTPException(409, {"message": "Products remain unprocessed.", "pending": pending})
     changed = await database.sales.find_one_and_update({"_id": sale_id, "status": "live"}, {"$set": {"status": "completed", "completed_at": now()}}, return_document=ReturnDocument.AFTER)
@@ -444,11 +464,37 @@ async def complete_sale(sale_id: str, payload: CompleteSale, _: dict = Depends(r
     await hub.publish(sale_id, {"type": "sale.completed"}); return changed
 
 
+@app.post("/admin/sales/{sale_id}/pause")
+async def pause_sale(sale_id: str, payload: PauseAuction, _: dict = Depends(require_admin), database=Depends(db)):
+    if await database.auctions.find_one({"sale_id": sale_id, "status": {"$in": ["running", "announcing", "settling"]}}):
+        raise HTTPException(409, "Finish the current product auction before pausing the sale.")
+    sale = await database.sales.find_one_and_update(
+        {"_id": sale_id, "status": "live", "is_paused": {"$ne": True}},
+        {"$set": {"is_paused": True, "pause_description": payload.description.strip(), "paused_at": now()}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not sale: raise HTTPException(409, "Only an unpaused live sale can be paused.")
+    await hub.publish(sale_id, {"type": "sale.paused"})
+    return {"ok": True}
+
+
+@app.post("/admin/sales/{sale_id}/resume")
+async def resume_sale(sale_id: str, _: dict = Depends(require_admin), database=Depends(db)):
+    sale = await database.sales.find_one_and_update(
+        {"_id": sale_id, "status": "live", "is_paused": True},
+        {"$set": {"is_paused": False}, "$unset": {"pause_description": "", "paused_at": ""}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not sale: raise HTTPException(409, "No paused live sale found.")
+    await hub.publish(sale_id, {"type": "sale.resumed"})
+    return {"ok": True}
+
+
 @app.post("/admin/sales/{sale_id}/start-next")
 async def start_next(sale_id: str, _: dict = Depends(require_admin), database=Depends(db)):
-    sale = await database.sales.find_one({"_id": sale_id, "status": "live"})
-    if not sale: raise HTTPException(409, "Sale is not live.")
-    if await database.auctions.find_one({"sale_id": sale_id, "status": "running"}): raise HTTPException(409, "An auction is already active.")
+    sale = await database.sales.find_one({"_id": sale_id, "status": "live", "is_paused": {"$ne": True}})
+    if not sale: raise HTTPException(409, "Sale is not live or is on a break.")
+    if await database.auctions.find_one({"sale_id": sale_id, "status": {"$in": ["running", "announcing", "settling"]}}): raise HTTPException(409, "An auction is already active.")
     product = await database.products.find_one({"sale_id": sale_id, "status": "prepared"}, sort=[("sequence", ASCENDING)])
     if not product: raise HTTPException(409, "No prepared product remains.")
     duration = product.get("round_duration_seconds", 30)
@@ -510,7 +556,6 @@ async def my_auctions(user: dict = Depends(current_user), database=Depends(db)):
 async def submit_bid(auction_id: str, payload: PresetBid, user: dict = Depends(current_user), database=Depends(db)):
     auction = await database.auctions.find_one({"_id": auction_id, "status": "running"})
     if not auction or as_utc(auction["ends_at"]) <= now(): raise HTTPException(409, "This round has ended.")
-    if auction["eligible_user_ids"] and user["sub"] not in auction["eligible_user_ids"]: raise HTTPException(403, "You are no longer eligible for this round.")
     profile = await database.users.find_one(user_id_filter(user["sub"]), {"phone": 1})
     if not profile or not profile.get("phone"): raise HTTPException(403, "Add your phone number before placing a bid.")
     prior = await database.bids.find_one({"auction_id": auction_id, "round": auction["round_number"], "user_id": user["sub"]})
