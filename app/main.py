@@ -1,20 +1,34 @@
 import asyncio
+import hashlib
+import hmac
 import secrets
 import re
+import time
 import httpx
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from pymongo import AsyncMongoClient, ASCENDING, ReturnDocument
 
 from .auction_engine import MAX_ROUNDS, PRESETS, resolve_round, validate_bid
 from .auth import current_user, decode_token, issue_token, require_admin
 from .config import settings
+from .payments import normalize_indian_phone, whatsapp_template_payload
+
+
+ACTIVE_AUCTION_STATUSES = ("running", "announcing", "starting", "settling")
+# A wall clock can be corrected forwards while a local server is running. Keep a
+# process-local elapsed-time guard so a newly started round never closes early.
+round_started_monotonic: dict[str, tuple[float, int]] = {}
+clock_anchor: datetime | None = None
+clock_anchor_monotonic = 0.0
+clock_lock = asyncio.Lock()
 
 
 class CreateSale(BaseModel):
@@ -59,6 +73,14 @@ class PauseAuction(BaseModel):
     description: str = Field(min_length=1, max_length=300)
 
 
+class PaymentSettings(BaseModel):
+    qr_url: str = Field(min_length=1, max_length=2000)
+
+
+class PaymentStatusUpdate(BaseModel):
+    payment_status: Literal["paid", "cancelled"]
+
+
 class UpdatePhone(BaseModel):
     phone: str = Field(min_length=8, max_length=24)
 
@@ -88,22 +110,128 @@ class Hub:
 hub = Hub()
 
 
+async def create_payment_request(database, result: dict, product: dict, sale_id: str) -> None:
+    """Create one durable payment request for an automatic auction winner."""
+    if result["status"] != "sold" or not result.get("winner_id") or result.get("manual_override"):
+        return
+    winner = await database.users.find_one(user_id_filter(result["winner_id"]), {"name": 1, "phone": 1})
+    sale = await database.sales.find_one({"_id": sale_id}, {"name": 1})
+    settings_doc = await database.settings.find_one({"_id": "payment"}, {"qr_url": 1})
+    recipient = normalize_indian_phone(winner.get("phone") if winner else None)
+    failure = None
+    if not recipient:
+        failure = "Winner does not have a valid Indian WhatsApp phone number."
+    elif not settings_doc or not settings_doc.get("qr_url"):
+        failure = "Payment QR is not configured."
+    request = {
+        "_id": oid(),
+        "result_id": result["_id"],
+        "sale_id": sale_id,
+        "sale_name": sale.get("name", "Fragrance Bucket sale") if sale else "Fragrance Bucket sale",
+        "product_id": product["_id"],
+        "product_name": product["name"],
+        "amount": result["price"],
+        "winner_id": result["winner_id"],
+        "winner_name": winner.get("name") if winner else None,
+        "recipient": recipient,
+        "qr_url": settings_doc.get("qr_url") if settings_doc else None,
+        "dispatch_status": "failed" if failure else "queued",
+        "delivery_status": None,
+        "payment_status": "pending",
+        "attempts": 0,
+        "last_error": failure,
+        "message_id": None,
+        "created_at": now(),
+        "updated_at": now(),
+    }
+    try:
+        await database.payment_requests.insert_one(request)
+    except Exception as error:
+        # The unique result index makes creation safe across worker restarts.
+        if "duplicate key" not in str(error).lower():
+            raise
+
+
+async def send_payment_request(request: dict) -> tuple[str | None, str | None]:
+    if not all((settings.whatsapp_access_token, settings.whatsapp_phone_number_id, settings.whatsapp_template_name)):
+        return None, "WhatsApp Cloud API is not configured."
+    if not request.get("recipient") or not request.get("qr_url"):
+        return None, "A recipient and payment QR are required."
+    payload = whatsapp_template_payload(
+        recipient=request["recipient"],
+        qr_url=request["qr_url"],
+        winner_name=request.get("winner_name") or "there",
+        product_name=request["product_name"],
+        sale_name=request["sale_name"],
+        amount=request["amount"],
+        template_name=settings.whatsapp_template_name,
+    )
+    url = f"https://graph.facebook.com/{settings.whatsapp_graph_api_version}/{settings.whatsapp_phone_number_id}/messages"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(url, json=payload, headers={"Authorization": f"Bearer {settings.whatsapp_access_token}"})
+    except httpx.HTTPError as error:
+        return None, f"WhatsApp request failed: {error}"
+    if response.is_error:
+        detail = response.json().get("error", {}).get("message", "WhatsApp rejected the request.")
+        return None, detail
+    return response.json().get("messages", [{}])[0].get("id"), None
+
+
+async def dispatch_payment_requests(database) -> None:
+    while True:
+        request = await database.payment_requests.find_one_and_update(
+            {"dispatch_status": "queued"},
+            {"$set": {"dispatch_status": "sending", "updated_at": now()}},
+            return_document=ReturnDocument.BEFORE,
+        )
+        if not request:
+            return
+        message_id, error = await send_payment_request(request)
+        update = {
+            "dispatch_status": "failed" if error else "sent",
+            "delivery_status": None if error else "sent",
+            "last_error": error,
+            "updated_at": now(),
+        }
+        if message_id:
+            update["message_id"] = message_id
+        await database.payment_requests.update_one(
+            {"_id": request["_id"]},
+            {"$set": update, "$inc": {"attempts": 1}},
+        )
+
+
 async def close_expired_rounds(database) -> None:
     """Claim expired rounds before resolving. Safe after restart; only one worker wins claim."""
     while True:
+        clock = await database_now(database)
         announced = await database.auctions.find_one_and_update(
-            {"status": "announcing", "transition_until": {"$lte": now()}},
+            {"status": "announcing", "transition_until": {"$lte": clock}},
             {"$set": {"status": "starting"}},
             return_document=ReturnDocument.BEFORE,
         )
         if announced:
             next_round = announced["pending_round_number"]
             duration = announced.get("round_duration_seconds", 30)
-            await database.auctions.update_one({"_id": announced["_id"]}, {"$set": {"status": "running", "round_number": next_round, "floor": announced["pending_floor"], "eligible_user_ids": announced["pending_eligible_user_ids"], "starts_at": now(), "ends_at": now() + timedelta(seconds=duration)}, "$unset": {"pending_round_number": "", "pending_floor": "", "pending_eligible_user_ids": "", "transition_until": "", "transition": ""}})
+            round_start = await database_now(database)
+            await database.auctions.update_one({"_id": announced["_id"]}, {"$set": {"status": "running", "round_number": next_round, "floor": announced["pending_floor"], "eligible_user_ids": announced["pending_eligible_user_ids"], "starts_at": round_start, "ends_at": round_start + timedelta(seconds=duration)}, "$unset": {"pending_round_number": "", "pending_floor": "", "pending_eligible_user_ids": "", "transition_until": "", "transition": ""}})
+            round_started_monotonic[announced["_id"]] = (time.monotonic(), duration)
             await hub.publish(announced["sale_id"], {"type": "round.started", "round": next_round})
             continue
+        candidate = await database.auctions.find_one(
+            {"status": "running", "ends_at": {"$lte": clock}},
+            sort=[("ends_at", ASCENDING)],
+        )
+        if not candidate:
+            return
+        started = round_started_monotonic.get(candidate["_id"])
+        if started and time.monotonic() - started[0] < started[1]:
+            # The system clock moved forward. Keep this round open until its
+            # configured real elapsed duration has passed.
+            return
         auction = await database.auctions.find_one_and_update(
-            {"status": "running", "ends_at": {"$lte": now()}},
+            {"_id": candidate["_id"], "status": "running", "ends_at": {"$lte": clock}},
             {"$set": {"status": "settling"}}, return_document=ReturnDocument.BEFORE,
         )
         if not auction: return
@@ -111,22 +239,64 @@ async def close_expired_rounds(database) -> None:
         resolution = resolve_round(round_number=auction["round_number"], bids=bids, prior_tied_users=tuple(auction["eligible_user_ids"]), prior_price=auction["floor"])
         if resolution.outcome == "next_round":
             next_round = auction["round_number"] + 1
-            await database.auctions.update_one({"_id": auction["_id"], "status": "settling"}, {"$set": {"status": "announcing", "pending_round_number": next_round, "pending_floor": resolution.price, "pending_eligible_user_ids": list(resolution.eligible_user_ids), "transition_until": now() + timedelta(seconds=3), "transition": {"participant_count": len(bids), "next_round": next_round}}})
+            transition_start = await database_now(database)
+            await database.auctions.update_one({"_id": auction["_id"], "status": "settling"}, {"$set": {"status": "announcing", "pending_round_number": next_round, "pending_floor": resolution.price, "pending_eligible_user_ids": list(resolution.eligible_user_ids), "transition_until": transition_start + timedelta(seconds=3), "transition": {"participant_count": len(bids), "next_round": next_round}}})
             await hub.publish(auction["sale_id"], {"type": "round.tie"})
             continue
         product_status = "unsold" if resolution.outcome == "unsold" else "sold"
-        result = {"auction_id": auction["_id"], "product_id": auction["product_id"], "status": product_status, "price": resolution.price, "winner_id": resolution.winner_id, "rounds_used": auction["round_number"], "final_eligible_user_ids": list(resolution.eligible_user_ids), "random_reason": resolution.random_reason, "completed_at": now()}
-        await database.auction_results.insert_one({"_id": oid(), **result})
+        result = {"auction_id": auction["_id"], "product_id": auction["product_id"], "status": product_status, "price": resolution.price, "winner_id": resolution.winner_id, "rounds_used": auction["round_number"], "final_eligible_user_ids": list(resolution.eligible_user_ids), "random_reason": resolution.random_reason, "completed_at": await database_now(database)}
+        result_id = oid()
+        result["_id"] = result_id
+        await database.auction_results.insert_one(result)
         await database.auctions.update_one({"_id": auction["_id"]}, {"$set": {"status": "completed", "result": result}})
         product = await database.products.find_one({"_id": auction["product_id"]}, {"name": 1, "quantity_ml": 1, "image_url": 1})
         await database.products.update_one({"_id": auction["product_id"]}, {"$set": {"status": product_status}})
-        await database.sales.update_one({"_id": auction["sale_id"]}, {"$set": {"last_result": {"product_id": auction["product_id"], "status": product_status, "price": resolution.price, "product_name": product["name"], "quantity_ml": product["quantity_ml"], "winner_id": resolution.winner_id, "random_reason": resolution.random_reason, "tied_count": len(resolution.eligible_user_ids)}}})
+        await database.sales.update_one(
+            {"_id": auction["sale_id"]},
+            {
+                "$set": {
+                    "last_result": {
+                        "product_id": auction["product_id"],
+                        "status": product_status,
+                        "price": resolution.price,
+                        "product_name": product["name"],
+                        "quantity_ml": product["quantity_ml"],
+                        "winner_id": resolution.winner_id,
+                        "random_reason": resolution.random_reason,
+                        "tied_count": len(resolution.eligible_user_ids),
+                    }
+                }
+            },
+        )
+        await database.sales.update_one(
+            {"_id": auction["sale_id"], "active_auction_id": auction["_id"]},
+            {"$unset": {"active_auction_id": ""}},
+        )
+        round_started_monotonic.pop(auction["_id"], None)
+        await create_payment_request(database, result, product, auction["sale_id"])
         await hub.publish(auction["sale_id"], {"type": "auction.completed"})
+
+
+async def reconcile_completed_auctions(database) -> None:
+    """Repair a completed auction if a reload interrupted its final writes."""
+    async for auction in database.auctions.find({"status": "completed"}, {"_id": 1, "sale_id": 1, "product_id": 1}):
+        result = await database.auction_results.find_one({"auction_id": auction["_id"]}, {"status": 1})
+        if not result:
+            continue
+        await database.products.update_one(
+            {"_id": auction["product_id"], "status": "active"},
+            {"$set": {"status": result["status"]}},
+        )
+        await database.sales.update_one(
+            {"_id": auction["sale_id"], "active_auction_id": auction["_id"]},
+            {"$unset": {"active_auction_id": ""}},
+        )
 
 
 async def round_worker(database):
     while True:
         await close_expired_rounds(database)
+        await dispatch_payment_requests(database)
         await asyncio.sleep(0.5)
 
 
@@ -135,11 +305,15 @@ async def lifespan(app: FastAPI):
     app.state.mongo = AsyncMongoClient(settings.mongodb_uri)
     app.state.db = app.state.mongo[settings.mongodb_database]
     await app.state.db.command("ping")
+    await database_now(app.state.db)
     print(f"MongoDB connected: {settings.mongodb_database}")
     await app.state.db.sales.create_index([("status", ASCENDING)])
     await app.state.db.products.create_index([("sale_id", ASCENDING), ("sequence", ASCENDING)])
     await app.state.db.bids.create_index([("auction_id", ASCENDING), ("round", ASCENDING), ("user_id", ASCENDING)], unique=True)
     await app.state.db.bids.create_index("client_bid_id", unique=True)
+    await app.state.db.payment_requests.create_index("result_id", unique=True)
+    await app.state.db.payment_requests.create_index([("dispatch_status", ASCENDING), ("created_at", ASCENDING)])
+    await reconcile_completed_auctions(app.state.db)
     worker = asyncio.create_task(round_worker(app.state.db))
     yield
     worker.cancel()
@@ -150,15 +324,33 @@ app = FastAPI(title="Fragrance Bucket API", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=[settings.web_origin], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
+@app.get("/health", include_in_schema=False)
+async def healthcheck():
+    return {"status": "ok"}
+
+
 def db(): return app.state.db
 def now(): return datetime.now(timezone.utc)
 def oid(): return str(uuid4())
 def as_utc(value: datetime) -> datetime: return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 def utc_iso(value: datetime) -> str: return as_utc(value).isoformat()
+async def database_now(database) -> datetime:
+    """Use one calibrated MongoDB clock without a remote call on every poll."""
+    global clock_anchor, clock_anchor_monotonic
+    elapsed = time.monotonic() - clock_anchor_monotonic
+    if clock_anchor is not None and elapsed < 15:
+        return clock_anchor + timedelta(seconds=elapsed)
+    async with clock_lock:
+        elapsed = time.monotonic() - clock_anchor_monotonic
+        if clock_anchor is None or elapsed >= 15:
+            clock_anchor = as_utc((await database.command("hello"))["localTime"])
+            clock_anchor_monotonic = time.monotonic()
+        return clock_anchor + timedelta(seconds=time.monotonic() - clock_anchor_monotonic)
 def user_id_filter(user_id: str) -> dict: return {"$expr": {"$eq": [{"$toString": "$_id"}, user_id]}}
 
 
 async def customer_snapshot(database, sale_id: str, user_id: str | None = None) -> dict:
+    clock = await database_now(database)
     sale = await database.sales.find_one({"_id": sale_id}, {"name": 1, "status": 1, "last_result": 1, "is_paused": 1, "pause_description": 1})
     if not sale: raise HTTPException(404, "Sale not found.")
     completed_auctions = [auction async for auction in database.auctions.find({"sale_id": sale_id, "status": "completed"}, {"_id": 1, "product_id": 1})]
@@ -178,7 +370,7 @@ async def customer_snapshot(database, sale_id: str, user_id: str | None = None) 
         }
         for result in completed_results
     ]
-    active = await database.auctions.find_one({"sale_id": sale_id, "status": {"$in": ["running", "announcing"]}})
+    active = await database.auctions.find_one({"sale_id": sale_id, "status": {"$in": ACTIVE_AUCTION_STATUSES}})
     last = sale.get("last_result")
     visible_last = None
     if last:
@@ -196,7 +388,7 @@ async def customer_snapshot(database, sale_id: str, user_id: str | None = None) 
                 "quantityMl": prepared_product["quantity_ml"],
                 "imageUrl": prepared_product.get("image_url"),
             }
-    result = {"saleId": sale_id, "saleName": sale["name"], "saleStatus": sale["status"], "lastResult": visible_last, "pastResults": past_results, "nextProduct": next_product}
+    result = {"saleId": sale_id, "saleName": sale["name"], "saleStatus": sale["status"], "serverNow": utc_iso(clock), "lastResult": visible_last, "pastResults": past_results, "nextProduct": next_product}
     if sale.get("is_paused"):
         result.update({"state": "paused", "pause": {"description": sale.get("pause_description", "The sale is taking a short break.")}})
         return result
@@ -204,8 +396,11 @@ async def customer_snapshot(database, sale_id: str, user_id: str | None = None) 
         result["state"] = "completed" if sale["status"] == "completed" else "waiting"
         return result
     product = await database.products.find_one({"_id": active["product_id"]}, {"name": 1, "quantity_ml": 1, "base_price": 1, "image_url": 1})
-    if active["status"] == "announcing":
+    if active["status"] in ("announcing", "starting"):
         result.update({"state": "transition", "transition": {"product": product, "nextRound": active["transition"]["next_round"], "participantCount": active["transition"]["participant_count"], "endsAt": utc_iso(active["transition_until"])}})
+        return result
+    if active["status"] == "settling":
+        result.update({"state": "settling", "auction": {"product": product}})
         return result
     personal_bid = None
     if user_id:
@@ -252,7 +447,9 @@ async def admin_sale_detail(sale_id: str, _: dict = Depends(require_admin), data
     sale = await database.sales.find_one({"_id": sale_id})
     if not sale: raise HTTPException(404, "Sale not found.")
     sale["products"] = [product async for product in database.products.find({"sale_id": sale_id}).sort("sequence", ASCENDING)]
-    sale["active_auction"] = await database.auctions.find_one({"sale_id": sale_id, "status": "running"})
+    sale["active_auction"] = await database.auctions.find_one(
+        {"sale_id": sale_id, "status": {"$in": ACTIVE_AUCTION_STATUSES}}
+    )
     if sale["active_auction"]:
         sale["active_auction"]["ends_at"] = utc_iso(sale["active_auction"]["ends_at"])
     auctions = [auction async for auction in database.auctions.find({"sale_id": sale_id}, {"_id": 1, "product_id": 1})]
@@ -307,6 +504,79 @@ async def upload_product_image(file: UploadFile = File(...), _: dict = Depends(r
     if response.is_error:
         raise HTTPException(502, "Image upload failed.")
     return {"url": response.json()["url"]}
+
+
+@app.get("/admin/payment-settings")
+async def get_payment_settings(_: dict = Depends(require_admin), database=Depends(db)):
+    payment = await database.settings.find_one({"_id": "payment"}, {"qr_url": 1, "updated_at": 1})
+    return {"qr_url": payment.get("qr_url") if payment else None, "configured": bool(payment and payment.get("qr_url"))}
+
+
+@app.put("/admin/payment-settings")
+async def update_payment_settings(payload: PaymentSettings, _: dict = Depends(require_admin), database=Depends(db)):
+    await database.settings.update_one(
+        {"_id": "payment"},
+        {"$set": {"qr_url": payload.qr_url.strip(), "updated_at": now()}},
+        upsert=True,
+    )
+    return {"qr_url": payload.qr_url.strip(), "configured": True}
+
+
+@app.post("/admin/payment-requests/{request_id}/resend")
+async def resend_payment_request(request_id: str, _: dict = Depends(require_admin), database=Depends(db)):
+    settings_doc = await database.settings.find_one({"_id": "payment"}, {"qr_url": 1})
+    if not settings_doc or not settings_doc.get("qr_url"):
+        raise HTTPException(409, "Configure a payment QR before resending.")
+    request = await database.payment_requests.find_one_and_update(
+        {"_id": request_id, "payment_status": "pending"},
+        {"$set": {"dispatch_status": "queued", "delivery_status": None, "last_error": None, "qr_url": settings_doc["qr_url"], "updated_at": now()}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not request:
+        raise HTTPException(409, "Only pending payment requests can be resent.")
+    return {"ok": True, "dispatch_status": request["dispatch_status"]}
+
+
+@app.patch("/admin/payment-requests/{request_id}/payment-status")
+async def update_payment_status(request_id: str, payload: PaymentStatusUpdate, _: dict = Depends(require_admin), database=Depends(db)):
+    request = await database.payment_requests.find_one_and_update(
+        {"_id": request_id},
+        {"$set": {"payment_status": payload.payment_status, "updated_at": now()}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not request:
+        raise HTTPException(404, "Payment request not found.")
+    return {"ok": True, "payment_status": request["payment_status"]}
+
+
+@app.get("/webhooks/whatsapp")
+async def verify_whatsapp_webhook(request: Request):
+    query = request.query_params
+    if settings.whatsapp_verify_token and query.get("hub.mode") == "subscribe" and hmac.compare_digest(query.get("hub.verify_token", ""), settings.whatsapp_verify_token):
+        return PlainTextResponse(query.get("hub.challenge", ""))
+    raise HTTPException(403, "Webhook verification failed.")
+
+
+@app.post("/webhooks/whatsapp")
+async def receive_whatsapp_webhook(request: Request, database=Depends(db)):
+    raw_body = await request.body()
+    if settings.whatsapp_app_secret:
+        provided = request.headers.get("X-Hub-Signature-256", "")
+        expected = "sha256=" + hmac.new(settings.whatsapp_app_secret.encode(), raw_body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(provided, expected):
+            raise HTTPException(403, "Invalid webhook signature.")
+    payload = await request.json()
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            for status_event in change.get("value", {}).get("statuses", []):
+                message_id = status_event.get("id")
+                delivery_status = status_event.get("status")
+                if message_id and delivery_status:
+                    await database.payment_requests.update_one(
+                        {"message_id": message_id},
+                        {"$set": {"delivery_status": delivery_status, "updated_at": now()}},
+                    )
+    return {"ok": True}
 
 
 @app.patch("/admin/products/{product_id}")
@@ -374,6 +644,19 @@ async def admin_product_detail(product_id: str, _: dict = Depends(require_admin)
         response["winner"] = {"name": winner.get("name"), "email": winner.get("email"), "phone": winner.get("phone")} if winner else None
         response["manual_buyer_phone"] = result.get("manual_buyer_phone")
         response["bid_history"] = [{"round": bid["round"], "amount": bid["amount"], "submitted_at": utc_iso(bid["submitted_at"]), "bidder": {"name": users.get(bid["user_id"], {}).get("name"), "email": users.get(bid["user_id"], {}).get("email")}} async for bid in database.bids.find({"auction_id": auction["_id"]}).sort("submitted_at", -1)] if auction else []
+        payment_request = await database.payment_requests.find_one({"result_id": result["_id"]})
+        if payment_request:
+            response["payment_request"] = {
+                "id": payment_request["_id"],
+                "recipient": payment_request.get("recipient"),
+                "amount": payment_request.get("amount"),
+                "qr_url": payment_request.get("qr_url"),
+                "dispatch_status": payment_request.get("dispatch_status"),
+                "delivery_status": payment_request.get("delivery_status"),
+                "payment_status": payment_request.get("payment_status"),
+                "attempts": payment_request.get("attempts", 0),
+                "last_error": payment_request.get("last_error"),
+            }
     return response
 
 
@@ -456,7 +739,7 @@ async def start_sale(sale_id: str, _: dict = Depends(require_admin), database=De
 
 @app.post("/admin/sales/{sale_id}/complete")
 async def complete_sale(sale_id: str, payload: CompleteSale, _: dict = Depends(require_admin), database=Depends(db)):
-    if await database.auctions.find_one({"sale_id": sale_id, "status": {"$in": ["running", "announcing", "settling"]}}): raise HTTPException(409, "Cannot complete sale during an active auction.")
+    if await database.auctions.find_one({"sale_id": sale_id, "status": {"$in": ACTIVE_AUCTION_STATUSES}}): raise HTTPException(409, "Cannot complete sale during an active auction.")
     pending = await database.products.count_documents({"sale_id": sale_id, "status": "prepared"})
     if pending and not payload.force: raise HTTPException(409, {"message": "Products remain unprocessed.", "pending": pending})
     changed = await database.sales.find_one_and_update({"_id": sale_id, "status": "live"}, {"$set": {"status": "completed", "completed_at": now()}}, return_document=ReturnDocument.AFTER)
@@ -466,7 +749,7 @@ async def complete_sale(sale_id: str, payload: CompleteSale, _: dict = Depends(r
 
 @app.post("/admin/sales/{sale_id}/pause")
 async def pause_sale(sale_id: str, payload: PauseAuction, _: dict = Depends(require_admin), database=Depends(db)):
-    if await database.auctions.find_one({"sale_id": sale_id, "status": {"$in": ["running", "announcing", "settling"]}}):
+    if await database.auctions.find_one({"sale_id": sale_id, "status": {"$in": ACTIVE_AUCTION_STATUSES}}):
         raise HTTPException(409, "Finish the current product auction before pausing the sale.")
     sale = await database.sales.find_one_and_update(
         {"_id": sale_id, "status": "live", "is_paused": {"$ne": True}},
@@ -494,12 +777,52 @@ async def resume_sale(sale_id: str, _: dict = Depends(require_admin), database=D
 async def start_next(sale_id: str, _: dict = Depends(require_admin), database=Depends(db)):
     sale = await database.sales.find_one({"_id": sale_id, "status": "live", "is_paused": {"$ne": True}})
     if not sale: raise HTTPException(409, "Sale is not live or is on a break.")
-    if await database.auctions.find_one({"sale_id": sale_id, "status": {"$in": ["running", "announcing", "settling"]}}): raise HTTPException(409, "An auction is already active.")
+    active_states = ACTIVE_AUCTION_STATUSES
+    # Compatibility recovery for locks written by an interrupted/reloaded local
+    # server. A lock is only removed when its own auction is no longer active.
+    locked_auction_id = sale.get("active_auction_id")
+    if locked_auction_id:
+        locked_auction = await database.auctions.find_one(
+            {"_id": locked_auction_id, "status": {"$in": active_states}},
+            {"_id": 1},
+        )
+        if locked_auction:
+            raise HTTPException(409, "An auction is already active.")
+        await database.sales.update_one(
+            {"_id": sale_id, "active_auction_id": locked_auction_id},
+            {"$unset": {"active_auction_id": ""}},
+        )
+    if await database.auctions.find_one({"sale_id": sale_id, "status": {"$in": active_states}}): raise HTTPException(409, "An auction is already active.")
     product = await database.products.find_one({"sale_id": sale_id, "status": "prepared"}, sort=[("sequence", ASCENDING)])
     if not product: raise HTTPException(409, "No prepared product remains.")
     duration = product.get("round_duration_seconds", 30)
-    auction = {"_id": oid(), "sale_id": sale_id, "product_id": product["_id"], "status": "running", "round_number": 1, "floor": product["base_price"], "round_duration_seconds": duration, "eligible_user_ids": [], "starts_at": now(), "ends_at": now() + timedelta(seconds=duration)}
-    await database.auctions.insert_one(auction); await database.products.update_one({"_id": product["_id"]}, {"$set": {"status": "active"}})
+    auction_id = oid()
+    # This atomic claim prevents double-clicks or concurrent admins from launching
+    # multiple prepared products in the same sale.
+    claimed_sale = await database.sales.find_one_and_update(
+        {"_id": sale_id, "status": "live", "is_paused": {"$ne": True}, "active_auction_id": {"$exists": False}},
+        {"$set": {"active_auction_id": auction_id}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not claimed_sale:
+        raise HTTPException(409, "An auction is already being started or is active.")
+    claimed_product = await database.products.find_one_and_update(
+        {"_id": product["_id"], "status": "prepared"},
+        {"$set": {"status": "active"}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not claimed_product:
+        await database.sales.update_one({"_id": sale_id, "active_auction_id": auction_id}, {"$unset": {"active_auction_id": ""}})
+        raise HTTPException(409, "That product is no longer available.")
+    started_at = await database_now(database)
+    auction = {"_id": auction_id, "sale_id": sale_id, "product_id": product["_id"], "status": "running", "round_number": 1, "floor": product["base_price"], "round_duration_seconds": duration, "eligible_user_ids": [], "starts_at": started_at, "ends_at": started_at + timedelta(seconds=duration)}
+    try:
+        await database.auctions.insert_one(auction)
+    except Exception:
+        await database.products.update_one({"_id": product["_id"], "status": "active"}, {"$set": {"status": "prepared"}})
+        await database.sales.update_one({"_id": sale_id, "active_auction_id": auction_id}, {"$unset": {"active_auction_id": ""}})
+        raise
+    round_started_monotonic[auction_id] = (time.monotonic(), duration)
     await hub.publish(sale_id, {"type": "auction.started"}); return auction
 
 
@@ -555,7 +878,7 @@ async def my_auctions(user: dict = Depends(current_user), database=Depends(db)):
 @app.post("/auctions/{auction_id}/bids")
 async def submit_bid(auction_id: str, payload: PresetBid, user: dict = Depends(current_user), database=Depends(db)):
     auction = await database.auctions.find_one({"_id": auction_id, "status": "running"})
-    if not auction or as_utc(auction["ends_at"]) <= now(): raise HTTPException(409, "This round has ended.")
+    if not auction or as_utc(auction["ends_at"]) <= await database_now(database): raise HTTPException(409, "This round has ended.")
     profile = await database.users.find_one(user_id_filter(user["sub"]), {"phone": 1})
     if not profile or not profile.get("phone"): raise HTTPException(403, "Add your phone number before placing a bid.")
     prior = await database.bids.find_one({"auction_id": auction_id, "round": auction["round_number"], "user_id": user["sub"]})

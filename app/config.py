@@ -11,6 +11,12 @@ class Settings(BaseSettings):
     imagekit_public_key: str = ""
     imagekit_private_key: str = ""
     imagekit_url_endpoint: str = ""
+    whatsapp_access_token: str = ""
+    whatsapp_phone_number_id: str = ""
+    whatsapp_template_name: str = ""
+    whatsapp_graph_api_version: str = "v23.0"
+    whatsapp_verify_token: str = ""
+    whatsapp_app_secret: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
