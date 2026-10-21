@@ -6,8 +6,7 @@ from .config import settings
 
 def issue_token(user_id: str, role: str) -> str:
     now = datetime.now(timezone.utc)
-    # Local admin sessions must survive normal sale preparation. Re-authenticate daily.
-    return jwt.encode({"sub": user_id, "role": role, "iat": now, "exp": now + timedelta(hours=8)}, settings.jwt_secret, algorithm="HS256")
+    return jwt.encode({"sub": user_id, "role": role, "iat": now, "exp": now + timedelta(days=30)}, settings.jwt_secret, algorithm="HS256")
 
 
 def current_user(authorization: str | None = Header(default=None)) -> dict:

@@ -841,8 +841,18 @@ async def get_sale(sale_id: str, user: dict = Depends(current_user), database=De
 
 @app.get("/me")
 async def get_me(user: dict = Depends(current_user), database=Depends(db)):
-    profile = await database.users.find_one(user_id_filter(user["sub"]), {"phone": 1})
-    return {"hasPhone": bool(profile and profile.get("phone"))}
+    profile = await database.users.find_one(
+        user_id_filter(user["sub"]), {"name": 1, "email": 1, "image": 1, "phone": 1}
+    )
+    if not profile:
+        raise HTTPException(401, "User profile not found.")
+    return {
+        "name": profile.get("name"),
+        "email": profile.get("email"),
+        "image": profile.get("image"),
+        "phone": profile.get("phone"),
+        "hasPhone": bool(profile.get("phone")),
+    }
 
 
 @app.put("/me/phone")
