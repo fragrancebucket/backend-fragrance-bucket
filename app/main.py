@@ -321,7 +321,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Fragrance Bucket API", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=[settings.web_origin], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+cors_origins = [
+    origin.strip().rstrip("/")
+    for origin in settings.web_origin.split(",")
+    if origin.strip()
+]
+print(f"CORS allowed origins: {', '.join(cors_origins)}")
+app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/health", include_in_schema=False)
