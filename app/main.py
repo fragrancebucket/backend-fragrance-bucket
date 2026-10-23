@@ -326,6 +326,9 @@ cors_origins = [
     for origin in settings.web_origin.split(",")
     if origin.strip()
 ]
+production_web_origin = "https://auction.fragrancebucket.com"
+if production_web_origin not in cors_origins:
+    cors_origins.append(production_web_origin)
 print(f"CORS allowed origins: {', '.join(cors_origins)}")
 app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
