@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 from random import SystemRandom
 
-PRESETS = (20, 30, 50, 100)
+PRESETS = (15, 30, 50, 80, 100, 200)
 MAX_ROUNDS = 5
 
 

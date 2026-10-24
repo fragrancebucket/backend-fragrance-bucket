@@ -922,7 +922,7 @@ async def submit_bid(auction_id: str, payload: PresetBid, user: dict = Depends(c
     if existing_request: return {"accepted": True, "amount": existing_request["amount"], "idempotent": True}
     amount = payload.amount
     difference = amount - auction["floor"]
-    if difference != 0 and (difference < 20 or difference % 10 != 0):
+    if difference != 0 and (difference < min(PRESETS) or difference % 5 != 0):
         raise HTTPException(422, "Choose a valid preset amount.")
     try: validate_bid(amount=amount, floor=auction["floor"], previous_amount=prior and prior["amount"])
     except ValueError as error: raise HTTPException(422, str(error)) from error
