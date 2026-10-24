@@ -465,8 +465,15 @@ async def admin_sale_detail(sale_id: str, _: dict = Depends(require_admin), data
     auction_ids = [auction["_id"] for auction in auctions]
     products_by_id = {product["_id"]: product for product in sale["products"]}
     product_by_auction = {auction["_id"]: products_by_id.get(auction["product_id"], {}) for auction in auctions}
-    users = {str(candidate["_id"]): candidate async for candidate in database.users.find({}, {"email": 1, "name": 1, "phone": 1})}
     sale["results"] = [result async for result in database.auction_results.find({"auction_id": {"$in": auction_ids}}).sort("completed_at", -1)]
+    winner_ids = list({result["winner_id"] for result in sale["results"] if result.get("winner_id")})
+    users = {
+        str(candidate["_id"]): candidate
+        async for candidate in database.users.find(
+            {"$expr": {"$in": [{"$toString": "$_id"}, winner_ids]}},
+            {"email": 1, "name": 1, "phone": 1},
+        )
+    } if winner_ids else {}
     for result in sale["results"]:
         result["product"] = products_by_id.get(result["product_id"])
         if result.get("winner_id"):
