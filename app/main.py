@@ -685,14 +685,24 @@ async def live_dashboard(sale_id: str, _: dict = Depends(require_admin), databas
     counts = {status: sum(product["status"] == status for product in products) for status in ("prepared", "active", "sold", "unsold", "skipped")}
     auction = await database.auctions.find_one({"sale_id": sale_id, "status": {"$in": ["running", "announcing", "settling"]}})
     all_auctions = [auction async for auction in database.auctions.find({"sale_id": sale_id}, {"_id": 1})]
-    results = [result async for result in database.auction_results.find({"auction_id": {"$in": [auction["_id"] for auction in all_auctions]}}).sort("completed_at", -1)]
-    result_users = {str(user["_id"]): user async for user in database.users.find({}, {"name": 1, "email": 1, "phone": 1})}
-    past_results = [{"productName": products_by_id.get(result["product_id"], {}).get("name", "Deleted product"), "status": result["status"], "price": result.get("price"), "winner": {"name": result_users.get(result.get("winner_id", ""), {}).get("name"), "email": result_users.get(result.get("winner_id", ""), {}).get("email"), "phone": result_users.get(result.get("winner_id", ""), {}).get("phone")}} for result in results]
+    auction_ids = [item["_id"] for item in all_auctions]
+    results = [result async for result in database.auction_results.find({"auction_id": {"$in": auction_ids}}).sort("completed_at", -1)] if auction_ids else []
+    bids = [bid async for bid in database.bids.find({"auction_id": auction["_id"], "round": auction["round_number"]}).sort("amount", -1)] if auction else []
+    user_ids = list({
+        *[result["winner_id"] for result in results if result.get("winner_id")],
+        *[bid["user_id"] for bid in bids],
+    })
+    users = {
+        str(user["_id"]): user
+        async for user in database.users.find(
+            {"$expr": {"$in": [{"$toString": "$_id"}, user_ids]}},
+            {"name": 1, "email": 1, "phone": 1},
+        )
+    } if user_ids else {}
+    past_results = [{"productName": products_by_id.get(result["product_id"], {}).get("name", "Deleted product"), "status": result["status"], "price": result.get("price"), "winner": {"name": users.get(result.get("winner_id", ""), {}).get("name"), "email": users.get(result.get("winner_id", ""), {}).get("email"), "phone": users.get(result.get("winner_id", ""), {}).get("phone")}} for result in results]
     dashboard = {"saleName": sale["name"], "saleStatus": sale["status"], "salePaused": sale.get("is_paused", False), "pauseDescription": sale.get("pause_description"), "liveConnections": len(hub.connections.get(sale_id, set())), "progress": counts, "auction": None, "bids": [], "lastResult": sale.get("last_result"), "pastResults": past_results}
     if not auction: return dashboard
     product = await database.products.find_one({"_id": auction["product_id"]}, {"name": 1, "quantity_ml": 1, "base_price": 1, "image_url": 1})
-    users = {str(user["_id"]): user async for user in database.users.find({}, {"name": 1, "email": 1})}
-    bids = [bid async for bid in database.bids.find({"auction_id": auction["_id"], "round": auction["round_number"]}).sort("amount", -1)]
     dashboard["auction"] = {"id": auction["_id"], "status": auction["status"], "round": auction["round_number"], "endsAt": utc_iso(auction["ends_at"]) if auction.get("ends_at") else None, "floor": auction["floor"], "product": product, "participantCount": len(bids)}
     dashboard["bids"] = [{"amount": bid["amount"], "updates": len(bid.get("history", [])), "submittedAt": utc_iso(bid["submitted_at"]), "bidder": {"name": users.get(bid["user_id"], {}).get("name"), "email": users.get(bid["user_id"], {}).get("email")}} for bid in bids]
     return dashboard
@@ -921,6 +931,7 @@ async def submit_bid(auction_id: str, payload: PresetBid, user: dict = Depends(c
     else:
         bid = {"_id": oid(), "auction_id": auction_id, "round": auction["round_number"], "user_id": user["sub"], "amount": amount, "client_bid_id": payload.client_bid_id, "client_bid_ids": [], "history": [{"amount": amount, "client_bid_id": payload.client_bid_id, "submitted_at": now()}], "submitted_at": now()}
         await database.bids.insert_one(bid)
+    await hub.publish(auction["sale_id"], {"type": "bid.accepted"})
     return {"accepted": True, "amount": amount, "idempotent": False}
 
 
